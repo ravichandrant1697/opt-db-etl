@@ -1,0 +1,13 @@
+node_modules/
+.env
+start_daily.bat
+trading.log
+
+# 2026-10-06: journal + engine state live in the Actions cache and go out on Telegram - never committed (public repo)
+option_dashboard.xlsx
+positions.json
+tuning.json
+ticks-*.csv
+ticks-*.csv.gz
+events-*.csv
+events-*.csv.gz

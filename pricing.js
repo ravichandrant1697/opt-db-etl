@@ -1,0 +1,303 @@
+/**
+ * PRICING — structure pricing, exit levels/decisions, and position sizing.
+ * Everything here works on the NET premium of a whole structure
+ * (Σ buy LTPs − Σ sell LTPs), never on individual legs.
+ */
+const {
+  STOP_PCT,
+  RISK_REWARD,
+  RULES,
+  SCALP_TARGET_PCT,
+  SCALP_STOP_PCT,
+  SCALP_LOCK_PCTS,
+  SCALP_LOCK_POINTS,
+  SCALP_TRAIL_ARM_PCT,
+  SCALP_TRAIL_PCT,
+  MAX_RISK,
+  LOT_SIZE,
+  MAX_LOTS,
+  CAPITAL,
+  MARGIN_PER_CREDIT_LOT,
+  COSTS
+} = require("./config");
+const { isSquareOffTime, daysUntil, nowIST } = require("./clock");
+const { getActiveHorizon } = require("./horizons");
+const { liveTicks } = require("./runtime");
+
+// Last traded price of one option (strike + CE/PE). Prefers a fresh
+// streamed tick (< 15s old) when the WebSocket is connected; falls back
+// to the polled chain value.
+function getLtp(chain, strike, type) {
+  const row = chain.find(r => r.strike_price === strike);
+  if (!row) return null;
+  const side = type === "CE" ? row.call_options : row.put_options;
+  const streamed = side?.instrument_key ? liveTicks.get(side.instrument_key) : null;
+  if (streamed && streamed.ltp !== null && Date.now() - streamed.at < 15000) {
+    return streamed.ltp;
+  }
+  return side?.market_data?.ltp ?? null;
+}
+
+// netPremium = Σ(buy LTPs) − Σ(sell LTPs).
+// Positive = debit strategy (spreads/straddle), negative = credit (condor).
+// Per-unit PnL = netNow − netEntry works for BOTH cases.
+function getNetPremium(chain, legs) {
+  let net = 0;
+  for (const leg of legs) {
+    const ltp = getLtp(chain, leg.strike, leg.type);
+    if (ltp === null) return null; // strike missing from chain — don't guess
+    net += leg.side === "BUY" ? ltp : -ltp;
+  }
+  return net;
+}
+
+// Exit levels by CONVICTION MODE (see OI_STRONG_RATIO in config):
+//   "ride"    strong OI dominance — targetDist null = NO fixed target;
+//             the SIGNAL_CHANGE reversal takes the profit, the stop still
+//             protects. (null, not Infinity: positions.json round-trips
+//             null safely; JSON turns Infinity into null anyway, but then
+//             a restart would compare move >= null — always true — and
+//             instantly close every ride position as a TARGET win.)
+//   "scalp"   bank a premium-relative band: target SCALP_TARGET_PCT (30%)
+//             of |net entry|, stop = target / RISK_REWARD keeps 1:2, and
+//             lockDists = the SCALP_LOCK_PCTS ladder (8/10/12.5%) — the
+//             highest rung the move has SEEN is armed; a pullback to that
+//             rung exits PROFIT_LOCK instead of letting the win round-trip
+//             back to the stop. lockDist = first rung (legacy). Percentages,
+//             not points: absolute 10/5-pt bands were NIFTY premium scale
+//             and unreachable on a ~₹4–13 stock structure.
+//   "default" Range structures — stop = STOP_PCT (50%) of net premium,
+//             target = RISK_REWARD (2) × stop (credit: full decay).
+// Naked legs keep the tight scalp stop in every mode — a 50% stop on a
+// naked ATM option is far too deep a drawdown.
+function exitLevels(netEntry, mode = "default", nakedLeg = false) {
+  const scalpTarget = Math.abs(netEntry) * SCALP_TARGET_PCT;
+  // Scalp/naked stop is its own % of entry (SCALP_STOP_PCT, 10%) since
+  // 2026-09-11 — no longer target / RISK_REWARD (15%): with the lock ladder
+  // banking at 8–12.5%, a 15% stop needed > 62% wins to break even.
+  const stopDist =
+    nakedLeg || mode === "scalp"
+      ? Math.abs(netEntry) * SCALP_STOP_PCT
+      : Math.abs(netEntry) * STOP_PCT;
+  const targetDist =
+    mode === "ride" ? null :
+    mode === "scalp" ? scalpTarget :
+    stopDist * RISK_REWARD;
+  // 2026-10-06: the % ladder plus an optional ABSOLUTE first rung
+  // (SCALP_LOCK_POINTS — SBIN ₹1 / NIFTY 10 / SENSEX 30 premium points),
+  // merged, sorted ascending and de-duplicated so checkExit's "highest
+  // rung seen" walk stays monotonic whichever rung is lowest for this
+  // premium. A config without SCALP_LOCK_POINTS → % ladder only.
+  const lockDists =
+    mode === "scalp"
+      ? [...new Set(
+          [...SCALP_LOCK_PCTS.map(p => Math.abs(netEntry) * p),
+           ...(SCALP_LOCK_POINTS > 0 ? [SCALP_LOCK_POINTS] : [])]
+            .map(d => Number(d.toFixed(4)))
+        )].sort((a, b) => a - b)
+      : null;
+  const lockDist = lockDists ? lockDists[0] : null;
+  return { stopDist, targetDist, lockDist, lockDists };
+}
+
+// Exit decision for an open position, horizon-aware. Priority order:
+//   STOP → TARGET → PROFIT_LOCK → TIME_STOP → EXPIRY_STOP →
+//   SIGNAL_CHANGE → SQUARE_OFF.
+//
+//   TIME_STOP      position held past the horizon's maxHoldDays
+//                  (positional 30d, swing 90d — the playbook's limits)
+//   EXPIRY_STOP    expiry within exitBufferDays — get out BEFORE the
+//                  gamma/theta cliff (playbook: greeks stop mattering
+//                  on expiry day)
+//   SIGNAL_CHANGE  bias REVERSED (Bullish↔Bearish) for signalPersistence
+//                  CONSECUTIVE polls. Drift to Range does NOT count: the
+//                  signal log shows bias wobbling Bearish↔Range on ~half
+//                  of all polls while spot trends one way — on the
+//                  2026-08-12 trend day, "Range" readings were correct
+//                  only 5% of the time at the 60-min horizon. A strategy1
+//                  re-rank doesn't count either; it re-ranks constantly.
+//   SQUARE_OFF     15:20 IST forced flat — intraday horizon only
+//
+// Sample data (positional, maxHold 30, buffer 2, persistence 3):
+//   day 12, DTE 20, bias mismatch on 1 poll  → hold (miss 1/3)
+//   day 12, DTE 20, mismatch 3 polls in a row → SIGNAL_CHANGE exit
+//   day 30, any signal                        → TIME_STOP exit
+//   DTE 2, any signal                         → EXPIRY_STOP exit
+//
+// Mutates pos._signalMiss/_lastMissTs (persisted in positions.json so a
+// restart keeps the count). Returns { outcome, reason } or null to hold.
+function checkExit(pos, netNow, result) {
+  const horizon = getActiveHorizon();
+  const move = netNow - pos.netEntry; // per-unit PnL
+  // WIN/LOSS for discretionary exits is decided on the NET rupee outcome
+  // (gross − estimated charges), not the gross move: the journal, the
+  // tuner AND the losing-streak breaker in state.canOpen read Result, and
+  // a "+₹62 gross / −₹50 net" trade calling itself WIN kept the breaker
+  // from ever tripping while the account bled.
+  const netWin = move * pos.lots * LOT_SIZE - (pos.estCharges ?? 0) >= 0;
+
+  if (move <= -pos.stopDist) return { outcome: "LOSS", reason: "STOP" };
+  // ride-mode positions have targetDist null — no fixed target, the
+  // SIGNAL_CHANGE reversal below is their take-profit
+  if (pos.targetDist != null && move >= pos.targetDist)
+    return { outcome: netWin ? "WIN" : "LOSS", reason: "TARGET" };
+
+  // PROFIT_LOCK ladder (scalp): pos.lockDists holds the rungs ascending
+  // (8/10/12.5% of entry). Each time the move trades ABOVE a rung, that
+  // rung becomes the armed floor (_lockLevel, persisted in positions.json
+  // so a restart keeps it — a step-trailing stop that only ratchets up).
+  // A pullback to/below the armed floor banks the win. Legacy positions
+  // carry a single lockDist/_lockArmed — treated as a one-rung ladder.
+  const rungs = pos.lockDists ?? (pos.lockDist != null ? [pos.lockDist] : null);
+  if (rungs) {
+    if (SCALP_TRAIL_PCT > 0) {
+      // Trailing floor (2026-10-12): the peak move is tracked on the position
+      // (_peakMove, persisted like _lockLevel). Once it has traded ABOVE
+      // SCALP_TRAIL_ARM_PCT of |entry| the floor = peak − SCALP_TRAIL_PCT of
+      // |entry|, ratcheting up only. Replaces the rung ladder once armed; a
+      // position that already carries a rung floor from before the switch
+      // keeps it as the minimum because the floor is never lowered.
+      const base = Math.abs(pos.netEntry);
+      if (pos._peakMove == null || move > pos._peakMove) pos._peakMove = move;
+      if (pos._peakMove > SCALP_TRAIL_ARM_PCT * base) {
+        const floor = Number((pos._peakMove - SCALP_TRAIL_PCT * base).toFixed(4));
+        if (pos._lockLevel == null || floor > pos._lockLevel) pos._lockLevel = floor;
+      }
+    } else {
+      if (pos._lockLevel == null && pos._lockArmed) pos._lockLevel = rungs[0];
+      for (const rung of rungs) {
+        if (move > rung && (pos._lockLevel == null || rung > pos._lockLevel)) pos._lockLevel = rung;
+      }
+    }
+    if (pos._lockLevel != null && move <= pos._lockLevel)
+      return { outcome: netWin ? "WIN" : "LOSS", reason: "PROFIT_LOCK" };
+
+    // Scalp time stop (2026-09-11): a scalp that has armed NO rung after
+    // RULES.scalpTimeStopMin is not a scalp any more — Range drift is not
+    // a SIGNAL_CHANGE and intraday has no maxHoldDays, so the 10 Sep SENSEX
+    // put sat 147 min bleeding theta until the −15% stop. Exit instead.
+    // Legacy positions without openedAtMs are left to the other rules.
+    if (
+      RULES.scalpTimeStopMin && pos._lockLevel == null && pos.openedAtMs &&
+      (Date.now() - pos.openedAtMs) / 60000 >= RULES.scalpTimeStopMin
+    )
+      return { outcome: netWin ? "WIN" : "LOSS", reason: "TIME_STOP" };
+  }
+
+  if (horizon.maxHoldDays) {
+    // openedAtMs is epoch ms (new positions). Legacy positions only carry
+    // openedAt — an IST wall-clock string, which parses as machine-local
+    // time and must therefore be measured against nowIST(), not Date.now().
+    const heldDays = pos.openedAtMs
+      ? (Date.now() - pos.openedAtMs) / 86400000
+      : (nowIST().getTime() - new Date(pos.openedAt).getTime()) / 86400000;
+    if (heldDays >= horizon.maxHoldDays)
+      return { outcome: netWin ? "WIN" : "LOSS", reason: "TIME_STOP" };
+  }
+
+  if (horizon.exitBufferDays && pos.expiry && daysUntil(pos.expiry) <= horizon.exitBufferDays)
+    return { outcome: netWin ? "WIN" : "LOSS", reason: "EXPIRY_STOP" };
+
+  // Only a true directional REVERSAL exits — Range drift and strategy
+  // re-ranks are noise (see the header comment). Range-entered positions
+  // (condor/straddle) exit when the market picks either direction.
+  const mismatch =
+    pos.entryBias === "Range"
+      ? result.bias !== "Range"
+      : (pos.entryBias === "Bullish" && result.bias === "Bearish") ||
+        (pos.entryBias === "Bearish" && result.bias === "Bullish");
+  if (mismatch) {
+    // Count once per analysis (result.timestamp) — the 2s stream sweep
+    // reuses the same poll result and must not inflate the count.
+    if (pos._lastMissTs !== result.timestamp) {
+      pos._signalMiss = (pos._signalMiss || 0) + 1;
+      pos._lastMissTs = result.timestamp;
+    }
+    // In NET profit (move covers the charges) a reversal is banked at
+    // signalPersistenceInProfit polls (intraday: 1 — the premium gives the
+    // gain back faster than 4 polls take). At a loss the full persistence
+    // still applies, so a single noisy poll cannot whipsaw a position out
+    // while the stop guards the downside.
+    const needed =
+      netWin && horizon.signalPersistenceInProfit != null
+        ? horizon.signalPersistenceInProfit
+        : horizon.signalPersistence;
+    if (pos._signalMiss >= needed)
+      return { outcome: netWin ? "WIN" : "LOSS", reason: "SIGNAL_CHANGE" };
+  } else if (pos._signalMiss) {
+    pos._signalMiss = 0; // signal realigned — reset the streak
+  }
+
+  if (horizon.squareOff && isSquareOffTime())
+    return { outcome: netWin ? "WIN" : "LOSS", reason: "SQUARE_OFF" };
+  return null;
+}
+
+// Net signed greek of a whole structure: Σ(buy greeks) − Σ(sell greeks).
+// e.g. net theta of a debit spread = theta(long leg) − theta(short leg) —
+// usually a small negative number, NOT the raw |theta| of one option.
+// Returns null when any leg lacks greeks (flat feed) — gates then skip.
+function getNetGreek(chain, legs, greek) {
+  let net = 0;
+  for (const leg of legs) {
+    const row = chain.find(r => r.strike_price === leg.strike);
+    const side = leg.type === "CE" ? row?.call_options : row?.put_options;
+    const g = side?.option_greeks?.[greek];
+    if (g == null) return null;
+    net += leg.side === "BUY" ? g : -g;
+  }
+  return net;
+}
+
+// Estimated Upstox round-trip charges (₹) for a structure: each leg is one
+// order on entry and one on exit. Flat brokerage dominates (₹20/order +
+// GST ≈ ₹94 for a 2-leg round trip); statutory charges are percentages of
+// premium turnover. Exit premiums are approximated by entry premiums —
+// good enough, the % components are tiny. Returns null if a leg has no LTP.
+// Sample: 2-leg spread, legs 38/17, 1 lot (qty 65)
+//   brokerage 4×20 = 80 | GST ~14.6 | STT ~3.6 | NSE txn ~2.5 | rest <1
+//   → ≈ ₹101 — vs the ₹51 average |gross PnL| of the first 11 live trades.
+function estimateRoundTripCharges(chain, legs, lots) {
+  const qty = Math.max(1, lots) * LOT_SIZE;
+  let brokerage = 0, stt = 0, txn = 0, sebi = 0, ipft = 0, stamp = 0;
+  for (const leg of legs) {
+    const ltp = getLtp(chain, leg.strike, leg.type);
+    if (ltp === null) return null; // strike missing — caller decides
+    const turnover = ltp * qty;
+    brokerage += 2 * COSTS.brokeragePerOrder; // entry order + exit order
+    txn += 2 * turnover * COSTS.nseTxn;
+    sebi += 2 * turnover * COSTS.sebiFee;
+    ipft += 2 * turnover * COSTS.ipft;
+    stt += turnover * COSTS.sttSell;    // every leg is sold once per round trip
+    stamp += turnover * COSTS.stampBuy; // ...and bought once
+  }
+  const gst = COSTS.gstRate * (brokerage + txn + sebi + ipft);
+  return Number((brokerage + stt + txn + sebi + ipft + stamp + gst).toFixed(2));
+}
+
+// Lot count from risk (MAX_RISK / risk-per-lot), then capped by what the
+// capital can carry (debit cost for long structures, approximate margin
+// for credit structures) and by the MAX_LOTS hard cap.
+function getLots(netEntry, stopDist) {
+  const riskPerLot = stopDist * LOT_SIZE;
+  if (riskPerLot <= 0) return 0;
+
+  let lots = Math.floor(MAX_RISK / riskPerLot);
+
+  const costPerLot = netEntry < 0 ? MARGIN_PER_CREDIT_LOT : netEntry * LOT_SIZE;
+  if (costPerLot > 0) lots = Math.min(lots, Math.floor(CAPITAL / costPerLot));
+
+  return Math.max(0, Math.min(lots, MAX_LOTS));
+}
+
+module.exports = {
+  getLtp,
+  getNetPremium,
+  exitLevels,
+  checkExit,
+  getLots,
+  getNetGreek,
+  estimateRoundTripCharges
+};
+
+//pricing.js
